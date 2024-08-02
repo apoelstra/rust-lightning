@@ -738,6 +738,12 @@ impl<T: sealed::Context> Features<T> {
 		}
 	}
 
+        /// Returns the feature set as a list of bytes, in little-endian. This is in reverse byte order
+        /// from most on-the-wire encodings.
+        pub fn as_le_bytes(&self) -> &[u8] {
+            &self.flags
+        }
+
 	#[cfg(test)]
 	/// Gets the underlying flags set, in LE.
 	pub fn le_flags(&self) -> &Vec<u8> {

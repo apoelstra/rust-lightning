@@ -1,10 +1,170 @@
 use core::fmt;
 use core::fmt::{Display, Formatter};
-use bech32::{ToBase32, u5, WriteBase32, Base32Len};
+use core::{array, iter, slice};
+
+use bech32::{u5, WriteBase32};
+use bech32_11::{ByteIterExt, Fe32, Fe32IterExt};
+use bech32_11::primitives::iter::BytesToFes;
 use crate::prelude::*;
 
-use super::{Bolt11Invoice, Sha256, TaggedField, ExpiryTime, MinFinalCltvExpiryDelta, Fallback, PayeePubKey, Bolt11InvoiceSignature, PositiveTimestamp,
+use lightning::ln::features::Bolt11InvoiceFeatures;
+use lightning::routing::router::RouteHintHop;
+
+use super::{Bolt11Invoice, Sha256, TaggedField, ExpiryTime, MinFinalCltvExpiryDelta, Fallback, PaymentSecret, PayeePubKey, Bolt11InvoiceSignature, PositiveTimestamp,
 	PrivateRoute, Description, RawTaggedField, Currency, RawHrp, SiPrefix, constants, SignedRawBolt11Invoice, RawDataPart};
+
+
+/// Private extension trait for converting a `RawHrp` to a bech32 `Hrp` object.
+trait RawHrpExt {
+	fn to_hrp(&self) -> bech32_11::Hrp;
+}
+
+impl RawHrpExt for RawHrp {
+	fn to_hrp(&self) -> bech32_11::Hrp {
+		use core::fmt::Write;
+
+		struct ByteFormatter {
+			arr: [u8; 90],
+			index: usize,
+		}
+
+		impl Write for ByteFormatter {
+			fn write_str(&mut self, s: &str) -> fmt::Result {
+				assert!(s.is_ascii());
+				assert!(self.index + s.len() < self.arr.len());
+				self.arr[self.index..self.index + s.len()].copy_from_slice(s.as_bytes());
+				Ok(())
+			}
+		}
+
+		let mut byte_formatter = ByteFormatter {
+			arr: [0; 90],
+			index: 0,
+		};
+
+                write!(byte_formatter, "{}", self).expect("custom Formatter cannot fail");
+
+		let s = core::str::from_utf8(&byte_formatter.arr[..byte_formatter.index])
+			.expect("asserted to be ASCII");
+		bech32_11::Hrp::parse_unchecked(s)
+	}
+}
+
+/// Objects that can be encoded to a formatter in bech32.
+///
+/// Private to this module to avoid polluting the API.
+trait Bech32Iterable {
+	/// This needs to be an explicit type because opaque types are not really
+	/// usable, and trait objects require allocations (and are likely to block
+	/// compiler optimizations for iterators).
+	type FeIter<'a>: Iterator<Item = Fe32> where Self: 'a;
+
+	fn fe_iter<'s>(&'s self) -> Self::FeIter<'s>;
+
+	fn fe_iter_len<'s>(&'s self) -> usize
+	where Self::FeIter<'s>: ExactSizeIterator
+	{
+		self.fe_iter().len()
+	}
+
+	fn fmt_bech32(&self, f: &mut Formatter) -> fmt::Result {
+		for fe in self.fe_iter() {
+			fe.to_char().fmt(f)?;
+		}
+		Ok(())
+	}
+}
+
+/// Helper function to encode byte data as a bech32 string, with no checksum or HRP
+fn encode_bytes_bech32(bytes: &[u8], f: &mut Formatter) -> fmt::Result {
+	for fe in bytes.iter().copied().bytes_to_fes() {
+		fe.to_char().fmt(f)?;
+	}
+	Ok(())
+}
+
+struct BeIntFeIter {
+	iter: core::iter::Skip<bech32_11::primitives::iter::BytesToFes<core::array::IntoIter<u8, 8>>>,
+}
+
+impl BeIntFeIter {
+	/// Constructor for an iterator which writes an integer as a variable-length
+	/// big-endian bech32 string.
+	fn var_len(int: u64) -> Self {
+		let bit_len = 64 - int.leading_zeros() as usize; // cast ok as value is in 0..=64.
+		let fe_len = (bit_len + 4) / 5;
+
+		BeIntFeIter {
+			iter: int.to_be_bytes().into_iter().bytes_to_fes().skip(13 - fe_len),
+		}
+	}
+
+	/// Constructor for an iterator which writes an integer as a fixed-length
+	/// big-endian bech32 string.
+	///
+	/// Panics if the integer would not fit into the provided length.
+	fn fixed_len(int: u64, len: usize) -> Self {
+		assert_eq!(int >> (len * 5), 0);
+		BeIntFeIter {
+			iter: int.to_be_bytes().into_iter().bytes_to_fes().skip(13 - len),
+		}
+	}
+}
+
+impl Iterator for BeIntFeIter {
+	type Item = Fe32;
+
+	fn next(&mut self) -> Option<Self::Item> {
+		self.iter.next()
+	}
+	
+	fn size_hint(&self) -> (usize, Option<usize>) {
+		self.iter.size_hint()
+	}
+}
+
+impl ExactSizeIterator for BeIntFeIter {
+	fn len(&self) -> usize {
+		self.iter.len()
+	}
+}
+
+
+/// Helper function to minimally encode an integer in big-endian bech32 characters.
+fn encode_int_be_base32(int: u64, pad_to_bytes: Option<usize>, f: &mut fmt::Formatter) -> fmt::Result {
+	if let Some(pad_to_bytes) = pad_to_bytes {
+		for _ in encoded_int_be_base32_size(int)..pad_to_bytes {
+			Fe32::Q.to_char().fmt(f)?;
+		}
+	}
+	for fe in int.to_be_bytes().into_iter().bytes_to_fes().skip_while(|fe| *fe == Fe32::Q) {
+		fe.to_char().fmt(f)?;
+	}
+	Ok(())
+}
+
+/// The length of the output of `encode_int_be_base32`.
+fn encoded_int_be_base32_size(int: u64) -> usize {
+	let bit_len = 64 - int.leading_zeros() as usize; // cast ok as value is in 0..=64.
+	(bit_len + 4) / 5
+}
+
+impl Bech32Iterable for [u8] {
+	type FeIter<'a> = BytesToFes<iter::Copied<slice::Iter<'a, u8>>>;
+
+	fn fe_iter<'s>(&'s self) -> Self::FeIter<'s> {
+		self.iter().copied().bytes_to_fes()
+	}
+}
+
+impl<const N: usize> Bech32Iterable for [u8; N] {
+	type FeIter<'a> = BytesToFes<array::IntoIter<u8, N>>;
+
+	fn fe_iter<'s>(&'s self) -> Self::FeIter<'s> {
+		(*self).into_iter().bytes_to_fes()
+	}
+}
+
 
 /// Converts a stream of bytes written to it to base32. On finalization the according padding will
 /// be applied. That means the results of writing two data blocks with one or two `BytesToBase32`
@@ -107,48 +267,47 @@ fn bytes_size_to_base32_size(byte_size: usize) -> usize {
 }
 
 impl Display for Bolt11Invoice {
-	fn fmt(&self, f: &mut Formatter) -> Result<(), fmt::Error> {
+	fn fmt(&self, f: &mut Formatter) -> fmt::Result {
 		self.signed_invoice.fmt(f)
 	}
 }
 
 impl Display for SignedRawBolt11Invoice {
-	fn fmt(&self, f: &mut Formatter) -> Result<(), fmt::Error> {
-		let hrp = self.raw_invoice.hrp.to_string();
-		let mut data  = self.raw_invoice.data.to_base32();
-		data.extend_from_slice(&self.signature.to_base32());
+	fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+		let hrp = self.raw_invoice.hrp.to_hrp();
 
-		bech32::encode_to_fmt(f, &hrp, data, bech32::Variant::Bech32).expect("HRP is valid")?;
-
+		for ch in self.raw_invoice.data.fe_iter().chain(self.signature.fe_iter()).with_checksum::<bech32_11::Bech32>(&hrp).chars() {
+			write!(f, "{}", ch)?;
+		}
 		Ok(())
 	}
 }
 
 /// This is not exported to bindings users
 impl Display for RawHrp {
-	fn fmt(&self, f: &mut Formatter) -> Result<(), fmt::Error> {
-		let amount = match self.raw_amount {
-			Some(ref amt) => amt.to_string(),
-			None => String::new(),
-		};
+       fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+               let amount = match self.raw_amount {
+                       Some(ref amt) => amt.to_string(),
+                       None => String::new(),
+               };
 
-		let si_prefix = match self.si_prefix {
-			Some(ref si) => si.to_string(),
-			None => String::new(),
-		};
+               let si_prefix = match self.si_prefix {
+                       Some(ref si) => si.to_string(),
+                       None => String::new(),
+               };
 
-		write!(
-			f,
-			"ln{}{}{}",
-			self.currency,
-			amount,
-			si_prefix
-		)
-	}
+               write!(
+                       f,
+                       "ln{}{}{}",
+                       self.currency,
+                       amount,
+                       si_prefix
+               )
+       }
 }
 
 impl Display for Currency {
-	fn fmt(&self, f: &mut Formatter) -> Result<(), fmt::Error> {
+	fn fmt(&self, f: &mut Formatter) -> fmt::Result {
 		let currency_code = match *self {
 			Currency::Bitcoin => "bc",
 			Currency::BitcoinTestnet => "tb",
@@ -161,7 +320,7 @@ impl Display for Currency {
 }
 
 impl Display for SiPrefix {
-	fn fmt(&self, f: &mut Formatter) -> Result<(), fmt::Error> {
+	fn fmt(&self, f: &mut Formatter) -> fmt::Result {
 		write!(f, "{}",
 			match *self {
 				SiPrefix::Milli => "m",
@@ -171,30 +330,6 @@ impl Display for SiPrefix {
 			}
 		)
 	}
-}
-
-fn encode_int_be_base32(int: u64) -> Vec<u5> {
-	let base = 32u64;
-
-	let mut out_vec = Vec::<u5>::new();
-
-	let mut rem_int = int;
-	while rem_int != 0 {
-		out_vec.push(u5::try_from_u8((rem_int % base) as u8).expect("always <32"));
-		rem_int /= base;
-	}
-
-	out_vec.reverse();
-	out_vec
-}
-
-fn encoded_int_be_base32_size(int: u64) -> usize {
-	for pos in (0..13).rev() {
-		if int & (0x1f << (5 * pos)) != 0 {
-			return (pos + 1) as usize;
-		}
-	}
-	0usize
 }
 
 fn encode_int_be_base256<T: Into<u64>>(int: T) -> Vec<u8> {
@@ -229,240 +364,261 @@ fn try_stretch<T>(mut in_vec: Vec<T>, target_len: usize) -> Option<Vec<T>>
 	}
 }
 
-impl ToBase32 for RawDataPart {
-	fn write_base32<W: WriteBase32>(&self, writer: &mut W) -> Result<(), <W as WriteBase32>::Err> {
-		// encode timestamp
-		self.timestamp.write_base32(writer)?;
+impl Bech32Iterable for RawDataPart {
+	type FeIter<'a> = iter::Chain<BeIntFeIter, iter::Flatten<iter::Map<slice::Iter<'a, RawTaggedField>, for<'r> fn(&'r RawTaggedField) -> <RawTaggedField as Bech32Iterable>::FeIter<'r>>>>;
 
-		// encode tagged fields
-		for tagged_field in self.tagged_fields.iter() {
-			tagged_field.write_base32(writer)?;
+	fn fe_iter<'s>(&'s self) -> Self::FeIter<'s> {
+		let ts_iter = self.timestamp.fe_iter();
+		let fields_iter = self.tagged_fields.iter().map(RawTaggedField::fe_iter as for<'r> fn(&'r RawTaggedField) -> <RawTaggedField as Bech32Iterable>::FeIter<'r>).flatten();
+		ts_iter.chain(fields_iter)
+	}
+}
+
+impl Bech32Iterable for PositiveTimestamp {
+	type FeIter<'a> = BeIntFeIter;
+
+	fn fe_iter<'s>(&'s self) -> Self::FeIter<'s> {
+		BeIntFeIter::fixed_len(self.as_unix_timestamp(), 7)
+	}
+}
+
+
+enum RawTaggedFieldIter<'s> {
+	UnknownSemantics(iter::Map<iter::Copied<slice::Iter<'s, u5>>, fn(u5) -> Fe32>),
+	KnownSemantics(<TaggedField as Bech32Iterable>::FeIter<'s>),
+}
+
+impl<'s> Iterator for RawTaggedFieldIter<'s> {
+	type Item = Fe32;
+
+	fn next(&mut self) -> Option<Self::Item> {
+		match *self {
+			RawTaggedFieldIter::UnknownSemantics(ref mut i) => i.next(),
+			RawTaggedFieldIter::KnownSemantics(ref mut i) => i.next(),
 		}
+	}
 
-		Ok(())
+	fn size_hint(&self) -> (usize, Option<usize>) {
+		match *self {
+			RawTaggedFieldIter::UnknownSemantics(ref i) => i.size_hint(),
+			RawTaggedFieldIter::KnownSemantics(ref i) => i.size_hint(),
+		}
 	}
 }
 
-impl ToBase32 for PositiveTimestamp {
-	fn write_base32<W: WriteBase32>(&self, writer: &mut W) -> Result<(), <W as WriteBase32>::Err> {
-		// FIXME: use writer for int encoding
-		writer.write(
-			&try_stretch(encode_int_be_base32(self.as_unix_timestamp()), 7)
-				.expect("Can't be longer due than 7 u5s due to timestamp bounds")
-		)
-	}
-}
+impl Bech32Iterable for RawTaggedField {
+	type FeIter<'a> = RawTaggedFieldIter<'a>;
 
-impl ToBase32 for RawTaggedField {
-	fn write_base32<W: WriteBase32>(&self, writer: &mut W) -> Result<(), <W as WriteBase32>::Err> {
+	fn fe_iter<'s>(&'s self) -> Self::FeIter<'s> {
 		match *self {
 			RawTaggedField::UnknownSemantics(ref content) => {
-				writer.write(content)
-			},
+				RawTaggedFieldIter::UnknownSemantics(content.iter().copied().map(|u5| Fe32::try_from(u5.to_u8()).unwrap()))
+			}
 			RawTaggedField::KnownSemantics(ref tagged_field) => {
-				tagged_field.write_base32(writer)
+				RawTaggedFieldIter::KnownSemantics(tagged_field.fe_iter())
 			}
 		}
 	}
 }
 
-impl ToBase32 for Sha256 {
-	fn write_base32<W: WriteBase32>(&self, writer: &mut W) -> Result<(), <W as WriteBase32>::Err> {
-		(&self.0[..]).write_base32(writer)
-	}
-}
-impl Base32Len for Sha256 {
-	fn base32_len(&self) -> usize {
-		(&self.0[..]).base32_len()
+impl Bech32Iterable for Sha256 {
+	type FeIter<'a> = <[u8] as Bech32Iterable>::FeIter<'a>;
+
+	fn fe_iter<'s>(&'s self) -> Self::FeIter<'s> {
+		self.0[..].fe_iter()
 	}
 }
 
-impl ToBase32 for Description {
-	fn write_base32<W: WriteBase32>(&self, writer: &mut W) -> Result<(), <W as WriteBase32>::Err> {
-		self.0.0.as_bytes().write_base32(writer)
+impl Bech32Iterable for Description {
+	type FeIter<'a> = <[u8] as Bech32Iterable>::FeIter<'a>;
+
+	fn fe_iter<'s>(&'s self) -> Self::FeIter<'s> {
+		self.0.0.as_bytes().fe_iter()
 	}
 }
 
-impl Base32Len for Description {
-	fn base32_len(&self) -> usize {
-		self.0.0.as_bytes().base32_len()
+impl Bech32Iterable for PayeePubKey {
+	type FeIter<'a> = <[u8; 33] as Bech32Iterable>::FeIter<'a>;
+
+	fn fe_iter<'s>(&'s self) -> Self::FeIter<'s> {
+		self.serialize().into_iter().bytes_to_fes()
 	}
 }
 
-impl ToBase32 for PayeePubKey {
-	fn write_base32<W: WriteBase32>(&self, writer: &mut W) -> Result<(), <W as WriteBase32>::Err> {
-		(&self.serialize()[..]).write_base32(writer)
+impl Bech32Iterable for ExpiryTime {
+	type FeIter<'a> = BeIntFeIter;
+
+	fn fe_iter<'s>(&'s self) -> Self::FeIter<'s> {
+		BeIntFeIter::var_len(self.as_seconds())
 	}
 }
 
-impl Base32Len for PayeePubKey {
-	fn base32_len(&self) -> usize {
-		bytes_size_to_base32_size(secp256k1::constants::PUBLIC_KEY_SIZE)
+impl Bech32Iterable for MinFinalCltvExpiryDelta {
+	type FeIter<'a> = BeIntFeIter;
+
+	fn fe_iter<'s>(&'s self) -> Self::FeIter<'s> {
+		BeIntFeIter::var_len(self.0)
 	}
 }
 
-impl ToBase32 for ExpiryTime {
-	fn write_base32<W: WriteBase32>(&self, writer: &mut W) -> Result<(), <W as WriteBase32>::Err> {
-		writer.write(&encode_int_be_base32(self.as_seconds()))
-	}
-}
+impl Bech32Iterable for Fallback {
+	type FeIter<'a> = iter::Chain<iter::Once<Fe32>, BytesToFes<iter::Copied<slice::Iter<'a, u8>>>>;
 
-impl Base32Len for ExpiryTime {
-	fn base32_len(&self) -> usize {
-		encoded_int_be_base32_size(self.0.as_secs())
-	}
-}
-
-impl ToBase32 for MinFinalCltvExpiryDelta {
-	fn write_base32<W: WriteBase32>(&self, writer: &mut W) -> Result<(), <W as WriteBase32>::Err> {
-		writer.write(&encode_int_be_base32(self.0))
-	}
-}
-
-impl Base32Len for MinFinalCltvExpiryDelta {
-	fn base32_len(&self) -> usize {
-		encoded_int_be_base32_size(self.0)
-	}
-}
-
-impl ToBase32 for Fallback {
-	fn write_base32<W: WriteBase32>(&self, writer: &mut W) -> Result<(), <W as WriteBase32>::Err> {
+	fn fe_iter<'s>(&'s self) -> Self::FeIter<'s> {
 		match *self {
 			Fallback::SegWitProgram {version: v, program: ref p} => {
-				writer.write_u5(u5::try_from_u8(v.to_num()).expect("witness version <= 16"))?;
-				p.write_base32(writer)
-			},
+				let v = Fe32::try_from(v.to_num()).expect("valid version");
+				core::iter::once(v).chain(p[..].fe_iter())
+			}
 			Fallback::PubKeyHash(ref hash) => {
-				writer.write_u5(u5::try_from_u8(17).expect("17 < 32"))?;
-				(&hash[..]).write_base32(writer)
-			},
+				core::iter::once(Fe32::_3).chain(hash[..].fe_iter())
+			}
 			Fallback::ScriptHash(ref hash) => {
-				writer.write_u5(u5::try_from_u8(18).expect("18 < 32"))?;
-				(&hash[..]).write_base32(writer)
+				core::iter::once(Fe32::J).chain(hash[..].fe_iter())
 			}
 		}
 	}
 }
 
-impl Base32Len for Fallback {
-	fn base32_len(&self) -> usize {
+// Rust makes me write this type...
+type RouteHintHopIter = iter::Chain<iter::Chain<iter::Chain<iter::Chain<array::IntoIter<u8, 33>, array::IntoIter<u8, 8>>, array::IntoIter<u8, 4>>, array::IntoIter<u8, 4>>, array::IntoIter<u8, 2>>;
+
+impl Bech32Iterable for PrivateRoute {
+	// ...and this one
+	type FeIter<'s> = BytesToFes<iter::Flatten<iter::Map<slice::Iter<'s, RouteHintHop>, for<'a> fn(&'a RouteHintHop) -> RouteHintHopIter>>>;
+
+	fn fe_iter<'s>(&'s self) -> Self::FeIter<'s> {
+		fn serialize_to_iter(hop: &RouteHintHop) -> RouteHintHopIter {
+			let i1 = hop.src_node_id.serialize().into_iter();
+			let i2 = u64::to_be_bytes(hop.short_channel_id).into_iter();
+			let i3 = u32::to_be_bytes(hop.fees.base_msat).into_iter();
+			let i4 = u32::to_be_bytes(hop.fees.proportional_millionths).into_iter();
+			let i5 = u16::to_be_bytes(hop.cltv_expiry_delta).into_iter();
+			i1.chain(i2).chain(i3).chain(i4).chain(i5)
+		}
+
+		// ...and apparently I need this cast
+		self.0.0.iter().map(serialize_to_iter as for<'a> fn(&'a RouteHintHop) -> RouteHintHopIter).flatten().bytes_to_fes()
+	}
+}
+
+impl Bech32Iterable for PaymentSecret {
+	type FeIter<'a> = <[u8] as Bech32Iterable>::FeIter<'a>;
+
+	fn fe_iter<'s>(&'s self) -> Self::FeIter<'s> {
+		self.0[..].fe_iter()
+	}
+}
+
+impl Bech32Iterable for Bolt11InvoiceSignature {
+	type FeIter<'a> = BytesToFes<iter::Chain<array::IntoIter<u8, 64>, iter::Once<u8>>>;
+
+	fn fe_iter<'s>(&'s self) -> Self::FeIter<'s> {
+		let (recovery_id, signature) = self.0.serialize_compact();
+		signature.into_iter().chain(core::iter::once(recovery_id.to_i32() as u8)).bytes_to_fes()
+	}
+}
+
+impl Bech32Iterable for Bolt11InvoiceFeatures {
+	type FeIter<'a> = BytesToFes<iter::Rev<iter::Copied<slice::Iter<'a, u8>>>>;
+
+	fn fe_iter<'s>(&'s self) -> Self::FeIter<'s> {
+		self.as_le_bytes().iter().copied().rev().bytes_to_fes()
+	}
+}
+
+type TaggedFieldIter<I> = core::iter::Chain<core::array::IntoIter<Fe32, 3>, I>;
+
+enum TaggedFieldIterEnum<'s> {
+	PaymentHash(TaggedFieldIter<<Sha256 as Bech32Iterable>::FeIter<'s>>),
+	Description(TaggedFieldIter<<Description as Bech32Iterable>::FeIter<'s>>),
+	PayeePubKey(TaggedFieldIter<<PayeePubKey as Bech32Iterable>::FeIter<'s>>),
+	DescriptionHash(TaggedFieldIter<<Sha256 as Bech32Iterable>::FeIter<'s>>),
+	ExpiryTime(TaggedFieldIter<<ExpiryTime as Bech32Iterable>::FeIter<'s>>),
+	MinFinalCltvExpiryDelta(TaggedFieldIter<<MinFinalCltvExpiryDelta as Bech32Iterable>::FeIter<'s>>),
+	Fallback(TaggedFieldIter<<Fallback as Bech32Iterable>::FeIter<'s>>),
+	PrivateRoute(TaggedFieldIter<<PrivateRoute as Bech32Iterable>::FeIter<'s>>),
+	PaymentSecret(TaggedFieldIter<<PaymentSecret as Bech32Iterable>::FeIter<'s>>),
+	PaymentMetadata(TaggedFieldIter<<[u8] as Bech32Iterable>::FeIter<'s>>),
+	Features(TaggedFieldIter<<Bolt11InvoiceFeatures as Bech32Iterable>::FeIter<'s>>),
+}
+
+impl<'s> Iterator for TaggedFieldIterEnum<'s> {
+	type Item = Fe32;
+
+	fn next(&mut self) -> Option<Self::Item> {
 		match *self {
-			Fallback::SegWitProgram {program: ref p, ..} => {
-				bytes_size_to_base32_size(p.len()) + 1
-			},
-			Fallback::PubKeyHash(_) | Fallback::ScriptHash(_) => {
-				33
-			},
+			TaggedFieldIterEnum::PaymentHash(ref mut i) => i.next(),
+			TaggedFieldIterEnum::Description(ref mut i) => i.next(),
+			TaggedFieldIterEnum::PayeePubKey(ref mut i) => i.next(),
+			TaggedFieldIterEnum::DescriptionHash(ref mut i) => i.next(),
+			TaggedFieldIterEnum::ExpiryTime(ref mut i) => i.next(),
+			TaggedFieldIterEnum::MinFinalCltvExpiryDelta(ref mut i) => i.next(),
+			TaggedFieldIterEnum::Fallback(ref mut i) => i.next(),
+			TaggedFieldIterEnum::PrivateRoute(ref mut i) => i.next(),
+			TaggedFieldIterEnum::PaymentSecret(ref mut i) => i.next(),
+			TaggedFieldIterEnum::PaymentMetadata(ref mut i) => i.next(),
+			TaggedFieldIterEnum::Features(ref mut i) => i.next(),
 		}
 	}
 }
 
-impl ToBase32 for PrivateRoute {
-	fn write_base32<W: WriteBase32>(&self, writer: &mut W) -> Result<(), <W as WriteBase32>::Err> {
-		let mut converter = BytesToBase32::new(writer);
+impl Bech32Iterable for TaggedField {
+	type FeIter<'a> = TaggedFieldIterEnum<'a>;
 
-		for hop in (self.0).0.iter() {
-			converter.append(&hop.src_node_id.serialize()[..])?;
-			let short_channel_id = try_stretch(
-				encode_int_be_base256(hop.short_channel_id),
-				8
-			).expect("sizeof(u64) == 8");
-			converter.append(&short_channel_id)?;
-
-			let fee_base_msat = try_stretch(
-				encode_int_be_base256(hop.fees.base_msat),
-				4
-			).expect("sizeof(u32) == 4");
-			converter.append(&fee_base_msat)?;
-
-			let fee_proportional_millionths = try_stretch(
-				encode_int_be_base256(hop.fees.proportional_millionths),
-				4
-			).expect("sizeof(u32) == 4");
-			converter.append(&fee_proportional_millionths)?;
-
-			let cltv_expiry_delta = try_stretch(
-				encode_int_be_base256(hop.cltv_expiry_delta),
-				2
-			).expect("sizeof(u16) == 2");
-			converter.append(&cltv_expiry_delta)?;
-		}
-
-		converter.finalize()?;
-		Ok(())
-	}
-}
-
-impl Base32Len for PrivateRoute {
-	fn base32_len(&self) -> usize {
-		bytes_size_to_base32_size((self.0).0.len() * 51)
-	}
-}
-
-impl ToBase32 for TaggedField {
-	fn write_base32<W: WriteBase32>(&self, writer: &mut W) -> Result<(), <W as WriteBase32>::Err> {
+	fn fe_iter<'s>(&'s self) -> Self::FeIter<'s> {
 		/// Writes a tagged field: tag, length and data. `tag` should be in `0..32` otherwise the
 		/// function will panic.
-		fn write_tagged_field<W, P>(writer: &mut W, tag: u8, payload: &P) -> Result<(), W::Err>
-			where W: WriteBase32,
-				  P: ToBase32 + Base32Len,
+		fn write_tagged_field<'s, P>(tag: u8, payload: &'s P) -> TaggedFieldIter<P::FeIter<'s>>
+			where P: Bech32Iterable + ?Sized
 		{
-			let len = payload.base32_len();
+			let (one, two) = payload.fe_iter().size_hint();
+			assert_eq!(Some(one), two, "sigh FIXME");
+			let len = one;
 			assert!(len < 1024, "Every tagged field data can be at most 1023 bytes long.");
 
-			writer.write_u5(u5::try_from_u8(tag).expect("invalid tag, not in 0..32"))?;
-			writer.write(&try_stretch(
-				encode_int_be_base32(len as u64),
-				2
-			).expect("Can't be longer than 2, see assert above."))?;
-			payload.write_base32(writer)
+			[
+				Fe32::try_from(tag).expect("invalid tag, not in 0..32"),
+				Fe32::try_from((len / 32) as u8).expect("< 32"),
+				Fe32::try_from((len % 32) as u8).expect("< 32"),
+			].into_iter().chain(payload.fe_iter())
 		}
 
 		match *self {
 			TaggedField::PaymentHash(ref hash) => {
-				write_tagged_field(writer, constants::TAG_PAYMENT_HASH, hash)
+				TaggedFieldIterEnum::PaymentHash(write_tagged_field(constants::TAG_PAYMENT_HASH, hash))
 			},
 			TaggedField::Description(ref description) => {
-				write_tagged_field(writer, constants::TAG_DESCRIPTION, description)
+				TaggedFieldIterEnum::Description(write_tagged_field(constants::TAG_DESCRIPTION, description))
 			},
 			TaggedField::PayeePubKey(ref pub_key) => {
-				write_tagged_field(writer, constants::TAG_PAYEE_PUB_KEY, pub_key)
+				TaggedFieldIterEnum::PayeePubKey(write_tagged_field(constants::TAG_PAYEE_PUB_KEY, pub_key))
 			},
 			TaggedField::DescriptionHash(ref hash) => {
-				write_tagged_field(writer, constants::TAG_DESCRIPTION_HASH, hash)
+				TaggedFieldIterEnum::DescriptionHash(write_tagged_field(constants::TAG_DESCRIPTION_HASH, hash))
 			},
 			TaggedField::ExpiryTime(ref duration) => {
-				write_tagged_field(writer, constants::TAG_EXPIRY_TIME, duration)
+				TaggedFieldIterEnum::ExpiryTime(write_tagged_field(constants::TAG_EXPIRY_TIME, duration))
 			},
 			TaggedField::MinFinalCltvExpiryDelta(ref expiry) => {
-				write_tagged_field(writer, constants::TAG_MIN_FINAL_CLTV_EXPIRY_DELTA, expiry)
+				TaggedFieldIterEnum::MinFinalCltvExpiryDelta(write_tagged_field(constants::TAG_MIN_FINAL_CLTV_EXPIRY_DELTA, expiry))
 			},
 			TaggedField::Fallback(ref fallback_address) => {
-				write_tagged_field(writer, constants::TAG_FALLBACK, fallback_address)
+				TaggedFieldIterEnum::Fallback(write_tagged_field(constants::TAG_FALLBACK, fallback_address))
 			},
 			TaggedField::PrivateRoute(ref route_hops) => {
-				write_tagged_field(writer, constants::TAG_PRIVATE_ROUTE, route_hops)
+				TaggedFieldIterEnum::PrivateRoute(write_tagged_field(constants::TAG_PRIVATE_ROUTE, route_hops))
 			},
 			TaggedField::PaymentSecret(ref payment_secret) => {
-				  write_tagged_field(writer, constants::TAG_PAYMENT_SECRET, payment_secret)
+				TaggedFieldIterEnum::PaymentSecret(write_tagged_field(constants::TAG_PAYMENT_SECRET, payment_secret))
 			},
 			TaggedField::PaymentMetadata(ref payment_metadata) => {
-				  write_tagged_field(writer, constants::TAG_PAYMENT_METADATA, payment_metadata)
+				TaggedFieldIterEnum::PaymentMetadata(write_tagged_field(constants::TAG_PAYMENT_METADATA, &payment_metadata[..]))
 			},
 			TaggedField::Features(ref features) => {
-				write_tagged_field(writer, constants::TAG_FEATURES, features)
+				TaggedFieldIterEnum::Features(write_tagged_field(constants::TAG_FEATURES, features))
 			},
 		}
-	}
-}
-
-impl ToBase32 for Bolt11InvoiceSignature {
-	fn write_base32<W: WriteBase32>(&self, writer: &mut W) -> Result<(), <W as WriteBase32>::Err> {
-		let mut converter = BytesToBase32::new(writer);
-		let (recovery_id, signature) = self.0.serialize_compact();
-		converter.append(&signature[..])?;
-		converter.append_u8(recovery_id.to_i32() as u8)?;
-		converter.finalize()
 	}
 }
 
