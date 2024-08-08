@@ -311,6 +311,38 @@ pub struct RawHrp {
 	pub si_prefix: Option<SiPrefix>,
 }
 
+impl RawHrp {
+	pub fn to_hrp(&self) -> bech32_11::Hrp {
+		// FIXME this logic should be upstreamed; see https://github.com/rust-bitcoin/rust-bech32/issues/195
+		use core::fmt::Write;
+
+		struct ByteFormatter {
+			arr: [u8; 90],
+			index: usize,
+		}
+
+		impl Write for ByteFormatter {
+			fn write_str(&mut self, s: &str) -> fmt::Result {
+				assert!(s.is_ascii());
+				assert!(self.index + s.len() < self.arr.len());
+				self.arr[self.index..self.index + s.len()].copy_from_slice(s.as_bytes());
+				Ok(())
+			}
+		}
+
+		let mut byte_formatter = ByteFormatter {
+			arr: [0; 90],
+			index: 0,
+		};
+
+                write!(byte_formatter, "{}", self).expect("custom Formatter cannot fail");
+
+		let s = core::str::from_utf8(&byte_formatter.arr[..byte_formatter.index])
+			.expect("asserted to be ASCII");
+		bech32_11::Hrp::parse_unchecked(s)
+	}
+}
+
 /// Data of the [`RawBolt11Invoice`] that is encoded in the data part
 #[derive(Eq, PartialEq, Debug, Clone, Hash, Ord, PartialOrd)]
 pub struct RawDataPart {
@@ -978,12 +1010,14 @@ impl RawBolt11Invoice {
 
 	/// Calculate the hash of the encoded `RawBolt11Invoice` which should be signed.
 	pub fn signable_hash(&self) -> [u8; 32] {
-		use bech32::ToBase32;
+		use bitcoin::hashes::HashEngine;
 
-		RawBolt11Invoice::hash_from_parts(
-			self.hrp.to_string().as_bytes(),
-			&self.data.to_base32()
-		)
+		let mut eng = sha256::Hash::engine();
+		eng.input(self.hrp.to_hrp().as_bytes());
+		for byte in self.data.byte_iter() {
+		    eng.input(&[byte]);
+		}
+		sha256::Hash::from_engine(eng).to_byte_array()
 	}
 
 	/// Signs the invoice using the supplied `sign_method`. This function MAY fail with an error of
